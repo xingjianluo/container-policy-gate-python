@@ -1,0 +1,36 @@
+{
+  "name": "default",
+  "version": 1,
+  "description": "容器工作负载基线合规策略（示例）",
+  "rules": [
+    {
+      "id": "image-fixed-tag",
+      "description": "镜像必须使用固定版本 tag，禁止 latest",
+      "match": {"kind": "Deployment"},
+      "field": "spec.image",
+      "operator": "regex",
+      "value": ":(?!latest$)[A-Za-z0-9._-]+$",
+      "severity": "high",
+      "on_violation": "deny"
+    },
+    {
+      "id": "resources-limits-present",
+      "description": "必须声明资源上限",
+      "match": {"kind": "Deployment"},
+      "field": "spec.resources.limits",
+      "operator": "present",
+      "severity": "medium",
+      "on_violation": "warn"
+    },
+    {
+      "id": "host-network-forbidden",
+      "description": "禁止使用主机网络",
+      "match": {"kind": "Deployment"},
+      "field": "spec.hostNetwork",
+      "operator": "ne",
+      "value": true,
+      "severity": "critical",
+      "on_violation": "deny"
+    }
+  ]
+}

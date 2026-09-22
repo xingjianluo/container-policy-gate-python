@@ -7,3 +7,8 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 运行时数据（保留示例策略与 .gitkeep）
+data/*.json
+data/*.lock
+!data/sample-policy.json
