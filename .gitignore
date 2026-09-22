@@ -7,3 +7,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 运行态数据（本地模拟准入状态）：不纳入版本库
+data/state/*.json
+data/state/*.lock

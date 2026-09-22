@@ -1,0 +1,45 @@
+{
+  "version": "v2",
+  "created_at": "2026-09-20T00:00:00Z",
+  "rules": [
+    {
+      "id": "R-IMAGE-REGISTRY",
+      "description": "镜像仓库必须在允许列表内",
+      "match_kinds": ["Pod", "Deployment"],
+      "field_path": "spec.image_repository",
+      "operator": "in",
+      "expected": ["registry.internal"],
+      "severity": "critical",
+      "on_violation": "reject"
+    },
+    {
+      "id": "R-CPU-LIMIT",
+      "description": "必须声明 CPU 上限",
+      "match_kinds": ["Pod"],
+      "field_path": "spec.cpu_limit",
+      "operator": "exists",
+      "severity": "medium",
+      "on_violation": "warn"
+    },
+    {
+      "id": "R-NO-PRIVILEGED",
+      "description": "禁止特权容器",
+      "match_kinds": ["Pod"],
+      "field_path": "spec.privileged",
+      "operator": "not_equals",
+      "expected": true,
+      "severity": "high",
+      "on_violation": "reject"
+    },
+    {
+      "id": "R-REPLICAS-MIN",
+      "description": "Deployment 副本数不得少于 2",
+      "match_kinds": ["Deployment"],
+      "field_path": "spec.replicas",
+      "operator": "greater_than",
+      "expected": 1,
+      "severity": "medium",
+      "on_violation": "warn"
+    }
+  ]
+}
