@@ -156,9 +156,21 @@ def test_concurrent_state_transitions_only_one_succeeds(container):
     log.info("并发状态流转结果: %s 最终状态=%s", results, final.status.value)
 
 
-def test_no_idempotency_key_creates_distinct_records(container, published_policy):
+def test_no_idempotency_key_same_content_deduped(container, published_policy):
+    """无幂等标识时按内容收口：同内容 + 同策略版本重复提交只产生一条记录。"""
     d1 = container.evaluator.admit(bad_resource(), "default")
     d2 = container.evaluator.admit(bad_resource(), "default")
+    assert d1.decision_id == d2.decision_id
+    assert len(container.decision_store.list_all()) == 1
+    log.info("无幂等键同内容重复提交 -> 复用判定 %s", d1.decision_id[:8])
+
+
+def test_no_idempotency_key_changed_content_new_record(container, published_policy):
+    """无幂等标识但内容有改动：必须视为新提交，产生新记录。"""
+    d1 = container.evaluator.admit(bad_resource(), "default")
+    changed = bad_resource()
+    changed["spec"]["image"] = "nginx:1.27.0"  # 内容改动 -> 新判定
+    d2 = container.evaluator.admit(changed, "default")
     assert d1.decision_id != d2.decision_id
     assert len(container.decision_store.list_all()) == 2
 

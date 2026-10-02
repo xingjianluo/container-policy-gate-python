@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 
 from .errors import NotFound, PolicyDocumentError
-from .models import Decision
+from .models import BatchResult, Decision
 
 router = APIRouter()
 
@@ -137,6 +137,7 @@ async def admit(request: Request) -> dict[str, Any]:
 
     body: {"resource": {...}, "policy_name": "...", "policy_version": 3,
            "idempotency_key": "..."}
+    不带 idempotency_key 时按 资源内容+策略版本 自动幂等。
     """
     body = await _json_body(request)
     resource = body.get("resource")
@@ -147,18 +148,77 @@ async def admit(request: Request) -> dict[str, Any]:
     idem_key = body.get("idempotency_key")
 
     container = _container(request)
-    prior = (
-        container.decision_store.get_by_idempotency_key(idem_key)
-        if isinstance(idem_key, str)
-        else None
+    version = policy_version if isinstance(policy_version, int) else None
+    key = idem_key if isinstance(idem_key, str) else None
+    prior = container.evaluator.find_existing(
+        resource, policy_name, policy_version=version, idempotency_key=key
     )
     decision = container.evaluator.admit(
         resource,
         policy_name,
-        policy_version=policy_version if isinstance(policy_version, int) else None,
-        idempotency_key=idem_key if isinstance(idem_key, str) else None,
+        policy_version=version,
+        idempotency_key=key,
     )
     return _decision_to_response(decision, idempotent_hit=prior is not None)
+
+
+def _batch_to_response(result: BatchResult) -> dict[str, Any]:
+    return {
+        "batch_id": result.batch_id,
+        "batch_fingerprint": result.batch_fingerprint,
+        "idempotent_hit": result.idempotent_hit,
+        "policy": {
+            "name": result.policy_name,
+            "version": result.policy_version,
+            "fingerprint": result.policy_fingerprint,
+        },
+        "summary": result.summary,
+        "decided_at": result.decided_at,
+        "items": [
+            (
+                {
+                    "index": item.index,
+                    "status": "decided",
+                    "resource_ref": item.resource_ref,
+                    "resource_fingerprint": item.resource_fingerprint,
+                    "reused": item.reused,
+                    "decision": _decision_to_response(item.decision),
+                }
+                if item.decision is not None
+                else {
+                    "index": item.index,
+                    "status": "invalid",
+                    "resource_fingerprint": item.resource_fingerprint,
+                    "error": item.error,
+                }
+            )
+            for item in result.items
+        ],
+    }
+
+
+@router.post("/api/admit/batch")
+async def admit_batch(request: Request) -> dict[str, Any]:
+    """批量准入：一次提交一组资源清单，逐条出结论并给出整批汇总。
+
+    body: {"resources": [{...}, ...], "policy_name": "...", "policy_version": 3}
+    - 整批落在同一策略快照（版本+指纹）上；
+    - 单条资源不合法只标记该条，不拖垮整批、也不静默放行；
+    - 同内容重复提交（含整批换序）自动复用首次结论。
+    """
+    body = await _json_body(request)
+    resources = body.get("resources")
+    if not isinstance(resources, list) or not resources:
+        raise PolicyDocumentError("请求缺少非空 'resources' 数组")
+    policy_name = body.get("policy_name", "default")
+    policy_version = body.get("policy_version")
+
+    result = _container(request).evaluator.admit_batch(
+        resources,
+        policy_name,
+        policy_version=policy_version if isinstance(policy_version, int) else None,
+    )
+    return _batch_to_response(result)
 
 
 @router.get("/api/decisions/{decision_id}")

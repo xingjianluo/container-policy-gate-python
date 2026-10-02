@@ -71,6 +71,27 @@ class DecisionStore:
             return None
         return self._to_model(data["decisions"][decision_id], include_snapshot=False)
 
+    # ---- 批次记录 ----
+
+    def get_batch(self, batch_fingerprint: str) -> dict[str, Any] | None:
+        """按批次内容指纹读取批次记录；不存在返回 None。"""
+        data = self._store.load()
+        return data.get("batches", {}).get(batch_fingerprint)
+
+    def save_batch_if_absent(self, record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """幂等保存批次记录，返回 (记录, 是否本次新建)。
+
+        批次内容指纹即主键：同一策略快照 + 同一组资源内容指纹（排序后）
+        重复提交时返回既有记录，不产生重复批次；并发下由锁内裁决保证唯一。
+        """
+        with self._store.mutate() as data:
+            batches = data.setdefault("batches", {})
+            existing = batches.get(record["batch_fingerprint"])
+            if existing is not None:
+                return existing, False
+            batches[record["batch_fingerprint"]] = record
+            return record, True
+
     def list_all(self) -> list[Decision]:
         data = self._store.load()
         return [

@@ -106,3 +106,36 @@ class Decision:
     hits: tuple[RuleHit, ...]
     rationale: str
     decided_at: str
+
+
+@dataclass(frozen=True)
+class BatchItemResult:
+    """批量准入中单条资源的结论。
+
+    status:
+    - "decided": 正常出判定（decision 非空；reused 表示复用了既有结论）；
+    - "invalid": 资源清单不合法（error 非空），不静默放行、也不拖垮整批。
+    """
+
+    index: int
+    status: str
+    resource_fingerprint: str
+    resource_ref: str | None = None
+    decision: Decision | None = None
+    reused: bool = False
+    error: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    """一批资源的准入结论：逐条结果 + 整批汇总，落在同一策略快照上。"""
+
+    batch_id: str
+    batch_fingerprint: str
+    idempotent_hit: bool
+    policy_name: str
+    policy_version: int
+    policy_fingerprint: str
+    items: tuple[BatchItemResult, ...]
+    summary: dict[str, Any]
+    decided_at: str
