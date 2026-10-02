@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .batch import BatchService
+from .batch_store import BatchStore
 from .clock import Clock, SystemClock
 from .decision_store import DecisionStore
 from .evaluator import Evaluator
@@ -29,14 +31,21 @@ class Container:
         self.policy_json_store = JsonStore(self.data_dir / "policies.json")
         self.decision_json_store = JsonStore(self.data_dir / "decisions.json")
         self.exemption_json_store = JsonStore(self.data_dir / "exemptions.json")
+        self.batch_json_store = JsonStore(self.data_dir / "batches.json")
 
         self.policy_store = PolicyStore(self.policy_json_store, self.clock)
         self.decision_store = DecisionStore(self.decision_json_store)
+        self.batch_store = BatchStore(self.batch_json_store)
         self.exemption_service = ExemptionService(self.exemption_json_store, self.clock)
         self.evaluator = Evaluator(
             self.policy_store,
             self.decision_store,
             self.exemption_service,
+            self.clock,
+        )
+        self.batch_service = BatchService(
+            self.batch_store,
+            self.evaluator,
             self.clock,
         )
 

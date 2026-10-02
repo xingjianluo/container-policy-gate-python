@@ -20,21 +20,24 @@ app/
 ├── policy_parser.py   # 策略文档解析（严格区分文档错误与规则语法错误）
 ├── policy_store.py    # 策略版本仓库（不可变、版本递增、指纹）
 ├── exemption.py       # 豁免：范围 + 有效期 + 状态机 + 幂等
-├── decision_store.py  # 判定记录仓库（不可变、幂等）
+├── decision_store.py  # 判定记录仓库（不可变、幂等键 + 内容指纹去重）
 ├── evaluator.py       # 评估引擎与历史复现 replay
+├── batch.py           # 批量准入（同一策略快照、逐条结论、整批汇总）
+├── batch_store.py     # 批量判定记录仓库（按批次内容指纹去重）
 ├── storage.py         # JSON 文件存储（原子写 + 线程锁 + fcntl 跨进程锁）
 ├── service.py         # 组件装配容器
 ├── api.py             # HTTP 路由
 ├── app.py             # FastAPI 工厂与错误映射
 data/sample-policy.json# 示例策略
-docs/                  # 策略模型 / 豁免规则 / 版本复现与并发语义
-tests/                 # 76 个测试（畸形策略、越界/过期豁免、并发重复提交…）
+docs/                  # 策略模型 / 豁免规则 / 版本复现 / 批量准入与重复上报
+tests/                 # 90 个测试（畸形策略、越界/过期豁免、并发重复提交、批量准入…）
 ```
 
 详细设计见：
 [`docs/policy-model.md`](docs/policy-model.md)、
 [`docs/exemption.md`](docs/exemption.md)、
-[`docs/versioning-and-replay.md`](docs/versioning-and-replay.md)。
+[`docs/versioning-and-replay.md`](docs/versioning-and-replay.md)、
+[`docs/batch-admission.md`](docs/batch-admission.md)。
 
 ## 快速开始
 
@@ -85,9 +88,33 @@ curl -s -X POST localhost:8000/api/admit -H 'content-type: application/json' -d 
 ```
 
 同一 `idempotency_key` 再提交一次，返回同一条记录且 `idempotent_hit: true`，
-不产生重复记录。
+不产生重复记录。**不带幂等标识**时，同一份资源内容在同一策略版本下重复
+提交也会自动复用既有结论（`content_reused: true`）；内容或策略版本有
+变化则视为新判定。
 
-### 3) 申请并批准豁免
+### 3) 批量提交一组资源清单
+
+```bash
+curl -s -X POST localhost:8000/api/admit/batch -H 'content-type: application/json' -d '{
+  "policy_name": "default",
+  "resources": [
+    {"apiVersion":"apps/v1","kind":"Deployment",
+     "metadata":{"name":"web","namespace":"prod"},
+     "spec":{"image":"nginx:latest"}},
+    {"kind":"Pod"}
+  ]
+}'
+```
+
+- 整批落在**同一个策略快照**上，响应携带本批 `policy.version/fingerprint`；
+- `items[]` 逐条给出结论、命中规则与判定依据；不合法的条目单独标记
+  `status=invalid` 及原因，不拖垮整批、也不静默放行；
+- `summary` 汇总整批结论，与提交顺序无关；同一批重复提交返回同一
+  `batch_id` 并标记 `reused: true`。
+
+语义细节见 [`docs/batch-admission.md`](docs/batch-admission.md)。
+
+### 4) 申请并批准豁免
 
 ```bash
 # 申请（范围 prod/web，仅豁免 image-fixed-tag，两小时有效）
@@ -105,7 +132,7 @@ curl -s -X POST localhost:8000/api/exemptions/<id>/approve
 此后同一资源的判定变为 `allow_with_warning`（违规仍如实记录，`exempted=true`）。
 豁免过期/越界/未批准都不会被采纳；撤销走 `/revoke`。
 
-### 4) 历史复现
+### 5) 历史复现
 
 ```bash
 curl -s -X POST localhost:8000/api/decisions/<decision_id>/replay
@@ -141,5 +168,9 @@ uv run pytest -s
   - 豁免范围越界（namespace/name/labels/rule_ids）、过期与未生效、未批准与撤销；
   - 非法状态流转（requested→revoked、重复 approve、终态再流转）；
   - 16 线程并发同键准入、12 线程并发同键豁免申请、并发 approve/reject 只有一个成功；
+  - 批量准入：逐条结论与整批汇总、换序一致、混入不合法资源单独标记；
+  - 无幂等标识重复上报收口：串行/并发同内容只留一条，整批重复提交复用首次汇总；
+  - 批次执行中发布新策略版本，整批仍按进入时的快照判定；
+  - 内容或策略版本变化算新提交，不错误复用；120 条大批量不重不漏；
   - 策略升级 v2 后历史判定按 v1 复现、跨进程重启后复现、篡改策略文件指纹被拒；
   - 全量 HTTP 端到端流程。

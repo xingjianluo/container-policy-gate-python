@@ -22,7 +22,7 @@ import uuid
 from typing import Any
 
 from .clock import Clock, parse_iso, to_iso
-from .decision_store import DecisionStore
+from .decision_store import DecisionStore, content_dedup_key
 from .errors import (
     PolicyDocumentError,
     PolicyVersionConflict,
@@ -71,7 +71,30 @@ class Evaluator:
         policy_version: int | None = None,
         idempotency_key: str | None = None,
     ) -> Decision:
-        """执行准入判定（按 idempotency_key 幂等）。"""
+        """执行准入判定（按 idempotency_key / 内容指纹幂等）。"""
+        return self.admit_with_meta(
+            resource,
+            policy_name,
+            policy_version=policy_version,
+            idempotency_key=idempotency_key,
+        )[0]
+
+    def admit_with_meta(
+        self,
+        resource: dict[str, Any],
+        policy_name: str,
+        *,
+        policy_version: int | None = None,
+        idempotency_key: str | None = None,
+    ) -> tuple[Decision, bool]:
+        """执行准入判定，返回 (判定, 是否复用既有记录)。
+
+        幂等层级：
+        1. 调用方提供 idempotency_key：键命中即复用（键优先，首决确定性）；
+        2. 未提供幂等键：按 (策略版本指纹 + 资源内容指纹) 去重，
+           同内容同策略版本的重复上报复用既有判定，不产生新记录；
+           内容或策略版本任一变化即视为新判定。
+        """
         # 1. 幂等短路（重复提交直接返回既有结论）
         if idempotency_key is not None:
             existing = self._decisions.get_by_idempotency_key(idempotency_key)
@@ -81,29 +104,66 @@ class Evaluator:
                     idempotency_key,
                     existing.decision_id,
                 )
-                return existing
+                return existing, True
 
         # 2. 资源校验：必填字段缺失等问题在此被明确拒绝
         validate_resource(resource)
 
         # 3. 选定策略版本
-        policy = self._select_policy(policy_name, policy_version)
+        policy = self.select_policy(policy_name, policy_version)
 
-        # 4/5. 评估 + 豁免
+        return self.admit_against_policy(
+            resource, policy, idempotency_key=idempotency_key
+        )
+
+    def admit_against_policy(
+        self,
+        resource: dict[str, Any],
+        policy: Policy,
+        *,
+        idempotency_key: str | None = None,
+    ) -> tuple[Decision, bool]:
+        """按给定的策略快照判定，返回 (判定, 是否复用既有记录)。
+
+        批量准入用此方法保证整批落在同一策略快照上：版本在进入批次时
+        选定一次，批次执行期间发布新版本不影响本批。
+        资源须已通过 validate_resource（此处再校验一次兜底）。
+        """
+        validate_resource(resource)
+
+        # 无幂等键时按内容指纹去重（同内容同策略版本 => 同一次判定）
+        res_fp = resource_fingerprint(resource)
+        content_key = content_dedup_key(
+            policy.name, policy.version, policy.fingerprint, res_fp
+        )
+        if idempotency_key is None:
+            existing = self._decisions.get_by_content_key(content_key)
+            if existing is not None:
+                logger.info(
+                    "admit content-dedup-hit resource=%s policy=%s@v%s decision_id=%s",
+                    existing.resource_ref,
+                    policy.name,
+                    policy.version,
+                    existing.decision_id,
+                )
+                return existing, True
+
+        # 评估 + 豁免
         decision = self._evaluate(resource, policy, idempotency_key)
 
         # 6. 不可变落盘（锁内最终幂等裁决，保证并发下唯一记录）
-        saved = self._decisions.save_if_absent(
-            decision, resource_snapshot=snapshot(resource)
+        saved, reused = self._decisions.save_if_absent(
+            decision, resource_snapshot=snapshot(resource), content_key=content_key
         )
         logger.info(
-            "admit decision_id=%s resource=%s policy=%s@v%s fp=%s action=%s rationale=%s",
+            "admit decision_id=%s resource=%s policy=%s@v%s fp=%s action=%s reused=%s rationale=%s",
             saved.decision_id,
             saved.resource_ref,
             saved.policy_name,
             saved.policy_version,
             saved.policy_fingerprint[:12],
             saved.action.value,
+            reused,
             saved.rationale,
         )
         for hit in saved.hits:
@@ -115,7 +175,7 @@ class Evaluator:
                 hit.exempted,
                 hit.reason,
             )
-        return saved
+        return saved, reused
 
     def get_decision(self, decision_id: str) -> Decision | None:
         return self._decisions.get(decision_id)
@@ -185,7 +245,8 @@ class Evaluator:
 
     # ---- internal ----
 
-    def _select_policy(self, name: str, version: int | None) -> Policy:
+    def select_policy(self, name: str, version: int | None) -> Policy:
+        """选定策略版本（显式版本或最新版）；不存在则明确报错。"""
         policy = self._policies.get(name, version) if version is not None else self._policies.latest(name)
         if policy is None:
             raise PolicyDocumentError(

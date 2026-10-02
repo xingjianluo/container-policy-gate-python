@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 
 from .errors import NotFound, PolicyDocumentError
-from .models import Decision
+from .models import BatchResult, Decision
 
 router = APIRouter()
 
@@ -98,7 +98,12 @@ async def get_policy(request: Request, name: str, version: int | None = None) ->
 # ---- 准入判定 ----
 
 
-def _decision_to_response(decision: Decision, *, idempotent_hit: bool = False) -> dict[str, Any]:
+def _decision_to_response(
+    decision: Decision,
+    *,
+    idempotent_hit: bool = False,
+    content_reused: bool = False,
+) -> dict[str, Any]:
     return {
         "decision_id": decision.decision_id,
         "idempotency_key": decision.idempotency_key,
@@ -113,6 +118,7 @@ def _decision_to_response(decision: Decision, *, idempotent_hit: bool = False) -
         "rationale": decision.rationale,
         "decided_at": decision.decided_at,
         "idempotent_hit": idempotent_hit,
+        "content_reused": content_reused,
         "hits": [
             {
                 "rule_id": h.rule_id,
@@ -147,18 +153,91 @@ async def admit(request: Request) -> dict[str, Any]:
     idem_key = body.get("idempotency_key")
 
     container = _container(request)
-    prior = (
-        container.decision_store.get_by_idempotency_key(idem_key)
-        if isinstance(idem_key, str)
-        else None
-    )
-    decision = container.evaluator.admit(
+    decision, reused = container.evaluator.admit_with_meta(
         resource,
         policy_name,
         policy_version=policy_version if isinstance(policy_version, int) else None,
         idempotency_key=idem_key if isinstance(idem_key, str) else None,
     )
-    return _decision_to_response(decision, idempotent_hit=prior is not None)
+    keyed = isinstance(idem_key, str)
+    return _decision_to_response(
+        decision,
+        idempotent_hit=reused and keyed,
+        content_reused=reused and not keyed,
+    )
+
+
+# ---- 批量准入 ----
+
+
+def _batch_to_response(batch: BatchResult) -> dict[str, Any]:
+    summary = batch.summary
+    return {
+        "batch_id": batch.batch_id,
+        "batch_fingerprint": batch.batch_fingerprint,
+        "policy": {
+            "name": batch.policy_name,
+            "version": batch.policy_version,
+            "fingerprint": batch.policy_fingerprint,
+        },
+        "created_at": batch.created_at,
+        "reused": batch.reused,
+        "summary": {
+            "total": summary.total,
+            "decided": summary.decided,
+            "invalid": summary.invalid,
+            "allow": summary.allow,
+            "allow_with_warning": summary.allow_with_warning,
+            "deny": summary.deny,
+            "action": summary.action.value,
+            "rationale": summary.rationale,
+        },
+        "items": [
+            {
+                "index": item.index,
+                "status": item.status,
+                "resource_ref": item.resource_ref,
+                "reused": item.reused,
+                "error": item.error,
+                "decision": (
+                    _decision_to_response(item.decision)
+                    if item.decision is not None
+                    else None
+                ),
+            }
+            for item in batch.items
+        ],
+    }
+
+
+@router.post("/api/admit/batch")
+async def admit_batch(request: Request) -> dict[str, Any]:
+    """批量提交资源清单做准入判定。
+
+    body: {"resources": [{...}, ...], "policy_name": "...", "policy_version": 3}
+    整批共用同一策略快照；个别资源不合法只标记该条，不影响其余条目。
+    """
+    body = await _json_body(request)
+    resources = body.get("resources")
+    if not isinstance(resources, list):
+        raise PolicyDocumentError("请求缺少 'resources' 数组")
+    policy_name = body.get("policy_name", "default")
+    policy_version = body.get("policy_version")
+
+    batch = _container(request).batch_service.admit_batch(
+        resources,
+        policy_name,
+        policy_version=policy_version if isinstance(policy_version, int) else None,
+    )
+    return _batch_to_response(batch)
+
+
+@router.get("/api/batches/{batch_id}")
+async def get_batch(request: Request, batch_id: str) -> dict[str, Any]:
+    batch = _container(request).batch_service.get_batch(batch_id)
+    if batch is None:
+        raise NotFound(f"批量判定记录不存在: {batch_id}")
+    return _batch_to_response(batch)
 
 
 @router.get("/api/decisions/{decision_id}")

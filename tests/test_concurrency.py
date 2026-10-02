@@ -156,9 +156,19 @@ def test_concurrent_state_transitions_only_one_succeeds(container):
     log.info("并发状态流转结果: %s 最终状态=%s", results, final.status.value)
 
 
-def test_no_idempotency_key_creates_distinct_records(container, published_policy):
+def test_no_idempotency_key_same_content_deduped(container, published_policy):
+    """无幂等标识时，同内容同策略版本的重复上报自动收口为一条记录。"""
     d1 = container.evaluator.admit(bad_resource(), "default")
     d2 = container.evaluator.admit(bad_resource(), "default")
+    assert d1.decision_id == d2.decision_id
+    assert len(container.decision_store.list_all()) == 1
+    log.info("无幂等键同内容重复上报 -> 复用判定 %s", d1.decision_id[:8])
+
+
+def test_no_idempotency_key_different_content_distinct_records(container, published_policy):
+    """无幂等标识但内容不同：必须各自落盘，不得错误复用。"""
+    d1 = container.evaluator.admit(bad_resource(), "default")
+    d2 = container.evaluator.admit(good_resource(), "default")
     assert d1.decision_id != d2.decision_id
     assert len(container.decision_store.list_all()) == 2
 

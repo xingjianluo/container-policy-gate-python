@@ -106,3 +106,57 @@ class Decision:
     hits: tuple[RuleHit, ...]
     rationale: str
     decided_at: str
+
+
+# 批量条目状态
+BATCH_ITEM_DECIDED = "decided"  # 正常出判定结论
+BATCH_ITEM_INVALID = "invalid"  # 资源清单不合法，单独标记，不影响整批
+
+
+@dataclass(frozen=True)
+class BatchItemResult:
+    """批量准入中单个资源的结论。
+
+    status=decided 时 decision 非空；status=invalid 时 error 非空。
+    reused=True 表示复用了同内容同策略版本的既有判定，未产生新记录。
+    """
+
+    index: int
+    status: str
+    resource_ref: str | None
+    decision: Decision | None
+    reused: bool
+    error: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class BatchSummary:
+    """整批汇总结论（只含计数与整体处置，与条目提交顺序无关）。"""
+
+    total: int
+    decided: int
+    invalid: int
+    allow: int
+    allow_with_warning: int
+    deny: int
+    action: Action
+    rationale: str
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    """一次批量准入的完整结论（不可变、可复现）。
+
+    batch_fingerprint 由排序后的条目内容指纹计算，
+    同一批资源换序提交得到同一批次标识与汇总。
+    """
+
+    batch_id: str
+    batch_fingerprint: str
+    policy_name: str
+    policy_version: int
+    policy_fingerprint: str
+    summary: BatchSummary
+    items: tuple[BatchItemResult, ...]
+    created_at: str
+    reused: bool = False
