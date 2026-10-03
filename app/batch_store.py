@@ -93,6 +93,7 @@ class BatchStore:
                     "status": item.status,
                     "resource_ref": item.resource_ref,
                     "reused": item.reused,
+                    "item_fingerprint": item.item_fingerprint,
                     "decision": (
                         decision_to_record(item.decision)
                         if item.decision is not None
@@ -129,6 +130,10 @@ class BatchStore:
                 ),
                 reused=i.get("reused", False),
                 error=i.get("error"),
+                # 历史记录无条目指纹时，已判定条目用资源内容指纹回填，
+                # 使换序重交的重排对旧记录同样生效
+                item_fingerprint=i.get("item_fingerprint")
+                or (i["decision"]["resource_fingerprint"] if i.get("decision") else ""),
             )
             for i in record["items"]
         )

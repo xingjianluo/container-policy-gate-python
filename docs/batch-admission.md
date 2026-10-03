@@ -29,8 +29,30 @@
   且计入 `summary.invalid`。
 - **顺序无关**：批次指纹由排序后的条目内容指纹计算，同一批资源换个
   顺序提交，得到同一个 `batch_id` 与同一份汇总。
+- **逐条结果始终按本次提交顺序排列**：即使命中批次级复用（换序重交、
+  重复提交），响应 `items[]` 也会按**本次**请求里资源的先后顺序重排，
+  `items[i]` 对应本次提交的第 `i` 个资源（`index` 从 0 顺排）——
+  上游按提交顺序把结论回填到对应资源时不会错位；字段缺失或内容不合法
+  的那一条也落在它在本次提交里原本的位置上。详见下节。
 - **规模**：上百条的批次可稳定跑完；每个资源内容恰好对应一条判定
   记录，不重不漏（见 `test_large_batch_stable_no_duplicate_no_missing`）。
+
+## 换序与重复提交时逐条结果的排列约定
+
+批次复用只复用**结论**，不复用**顺序**：
+
+- 同一批资源（内容不变）换序再交，`batch_id`、`summary` 与首次完全
+  一致，响应标记 `reused: true`，不产生新的批次记录或判定记录；
+- 但 `items[]` 按**本次**提交的顺序逐位返回：每条已存结论按条目内容
+  指纹与本次提交的资源一一配对（多重集匹配），`index` 重新编号为本次
+  位置。内容完全相同的条目结论相同，按出现先后依次配对，位置不会乱；
+- 不合法条目（`status=invalid`）同样参与对齐：它没有判定记录，靠提交时
+  原始条目的内容指纹定位，换序后仍落在它在本次提交里的位置，错误原因
+  跟着条目走；
+- 多个定时任务并发提交同一批（各自顺序不同）时，批次记录全局唯一，
+  每个提交方拿到的 `items[]` 都按**它自己**的提交顺序排列；
+- 只有资源内容确实改了、或策略版本（含策略内容指纹）换了，才算新的
+  一批：新的 `batch_id`、重新逐条判定。
 
 ## 重复上报的复用边界
 
@@ -91,14 +113,34 @@ curl -s -X POST localhost:8000/api/admit/batch -H 'content-type: application/jso
 # 再执行一次同一请求 -> reused: true，batch_id 与汇总不变
 ```
 
+换序重交（资源内容不变、仅顺序不同）验证逐条结果按本次提交顺序返回：
+
+```bash
+# 第一次：[web(deny), 不合法条目]
+# 第二次把两条对调再交 -> batch_id 不变、reused: true，
+# 且 items[0] 是不合法条目、items[1] 是 web 的 deny 结论（跟随本次顺序）
+curl -s -X POST localhost:8000/api/admit/batch -H 'content-type: application/json' -d '{
+  "policy_name": "default",
+  "resources": [
+    {"kind":"Pod"},
+    {"apiVersion":"apps/v1","kind":"Deployment",
+     "metadata":{"name":"web","namespace":"prod"},
+     "spec":{"image":"nginx:latest"}}
+  ]
+}'
+```
+
 运行测试（`-s` 打印每条用例的业务场景、策略版本与判定依据）：
 
 ```bash
 uv run pytest -s
 # 只看批量与重复上报相关用例
 uv run pytest tests/test_batch.py -s
+# 只看换序重交及相关边界用例
+uv run pytest tests/test_batch_reorder.py -s
 ```
 
-覆盖：批量提交与汇总、换序一致性、串行/并发无键重复上报、
+覆盖：批量提交与汇总、换序一致性、换序重交逐条对齐（含不合法条目、
+内容完全相同的条目）、串行/并发无键重复上报、多任务并发换序同批、
 批次混入不合法资源、批次执行中策略版本变化、内容/版本变更算新提交、
 120 条大批量、HTTP 端到端。

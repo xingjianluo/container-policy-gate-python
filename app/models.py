@@ -119,6 +119,8 @@ class BatchItemResult:
 
     status=decided 时 decision 非空；status=invalid 时 error 非空。
     reused=True 表示复用了同内容同策略版本的既有判定，未产生新记录。
+    item_fingerprint 是提交时原始条目的内容指纹（不合法条目也有），
+    换序重交时靠它把已存批次条目重新对齐到本次提交顺序。
     """
 
     index: int
@@ -127,6 +129,7 @@ class BatchItemResult:
     decision: Decision | None
     reused: bool
     error: dict[str, Any] | None
+    item_fingerprint: str = ""
 
 
 @dataclass(frozen=True)

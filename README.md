@@ -30,7 +30,7 @@ app/
 ├── app.py             # FastAPI 工厂与错误映射
 data/sample-policy.json# 示例策略
 docs/                  # 策略模型 / 豁免规则 / 版本复现 / 批量准入与重复上报
-tests/                 # 90 个测试（畸形策略、越界/过期豁免、并发重复提交、批量准入…）
+tests/                 # 97 个测试（畸形策略、越界/过期豁免、并发重复提交、批量准入…）
 ```
 
 详细设计见：
@@ -109,8 +109,9 @@ curl -s -X POST localhost:8000/api/admit/batch -H 'content-type: application/jso
 - 整批落在**同一个策略快照**上，响应携带本批 `policy.version/fingerprint`；
 - `items[]` 逐条给出结论、命中规则与判定依据；不合法的条目单独标记
   `status=invalid` 及原因，不拖垮整批、也不静默放行；
-- `summary` 汇总整批结论，与提交顺序无关；同一批重复提交返回同一
-  `batch_id` 并标记 `reused: true`。
+- `summary` 汇总整批结论，与提交顺序无关；同一批重复提交（含换序重交）
+  返回同一 `batch_id` 并标记 `reused: true`，且 `items[]` 始终按**本次**
+  提交顺序逐位对应返回。
 
 语义细节见 [`docs/batch-admission.md`](docs/batch-admission.md)。
 
