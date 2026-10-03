@@ -6,18 +6,21 @@
 - 单条资源不合法只标记该条（status=invalid），不拖垮整批，也不静默放行；
 - 条目级按 (策略版本指纹 + 资源内容指纹) 去重：无幂等标识的重复上报
   自动复用既有判定，不产生重复记录；内容或策略版本变化则视为新判定；
-- 批次级按排序后的条目指纹去重：同一批资源换序提交，批次标识与汇总一致。
+- 批次级按排序后的条目指纹去重：同一批资源换序提交，批次标识与汇总一致；
+- 换序/重复提交命中既有批次时，逐条结果按【本次请求】的资源顺序重排返回，
+  与提交位置一一对应（不合法条目也落在它本次的位置上）。
 """
 
 from __future__ import annotations
 
 import logging
+from collections import defaultdict, deque
 from dataclasses import replace
 from typing import Any
 
 from .batch_store import BatchStore
 from .clock import Clock, to_iso
-from .errors import PolicyDocumentError, ResourceValidationError
+from .errors import PolicyDocumentError, ResourceValidationError, StorageError
 from .evaluator import Evaluator
 from .models import (
     BATCH_ITEM_DECIDED,
@@ -58,7 +61,8 @@ class BatchService:
         - resources 必须是非空数组；数组内个别元素不合法只标记该条；
         - 整批落在进入批次时选定的同一策略快照上；
         - 同一批内容（与顺序无关）在同一策略版本下重复提交，
-          返回首次批次的结论并标记 reused。
+          复用首次批次的标识与汇总并标记 reused，但逐条结果按
+          【本次请求】的提交顺序排列，与资源位置一一对应。
         """
         if not isinstance(resources, list) or not resources:
             raise PolicyDocumentError(
@@ -80,7 +84,8 @@ class BatchService:
             }
         )
 
-        # 3. 批次级幂等短路：同内容批次重复提交直接复用首次结论
+        # 3. 批次级幂等短路：同内容批次重复提交直接复用首次结论，
+        #    但逐条结果必须按【本次请求】的资源顺序重排后再返回
         existing = self._batches.get_by_fingerprint(batch_fp)
         if existing is not None:
             logger.info(
@@ -90,7 +95,7 @@ class BatchService:
                 existing.policy_version,
                 existing.policy_fingerprint[:12],
             )
-            return replace(existing, reused=True)
+            return self._replay_in_request_order(existing, resources)
 
         logger.info(
             "batch start items=%d policy=%s@v%s fp=%s batch_fp=%s",
@@ -120,7 +125,9 @@ class BatchService:
             created_at=to_iso(self._clock.now()),
         )
 
-        # 6. 批次落盘（锁内最终裁决：并发同批提交只有一份记录）
+        # 6. 批次落盘（锁内最终裁决：并发同批提交只有一份记录）。
+        #    若被并发请求抢先落盘，批次标识/汇总以落盘记录为准，
+        #    但逐条结果用本次请求自己算出的条目（顺序即本次提交顺序）。
         saved, reused = self._batches.save_if_absent(batch)
         logger.info(
             "batch done batch_id=%s action=%s decided=%d invalid=%d reused=%s rationale=%s",
@@ -131,15 +138,66 @@ class BatchService:
             reused,
             saved.summary.rationale,
         )
-        return replace(saved, reused=True) if reused else saved
+        return replace(saved, items=items, reused=True) if reused else saved
 
     def get_batch(self, batch_id: str) -> BatchResult | None:
         return self._batches.get(batch_id)
 
     # ---- internal ----
 
+    def _replay_in_request_order(
+        self, stored: BatchResult, resources: list[Any]
+    ) -> BatchResult:
+        """把既有批次的条目结论按本次请求的资源顺序重排后返回。
+
+        对齐键是条目内容指纹（多重集匹配：批内完全相同的条目按出现
+        次序依次配对，内容相同结论也相同，配对结果不影响正确性）；
+        重排后 index 改写为本次请求中的位置，不合法条目同样落回
+        它本次的位置。命中即复用：decided 条目标记 reused=True，
+        整个过程不产生任何新的判定/批次记录。
+        """
+        pools: dict[str, deque[BatchItemResult]] = defaultdict(deque)
+        for item in stored.items:
+            # 旧记录缺 item_fingerprint 时，decided 条目回退用判定的资源指纹
+            fp = item.item_fingerprint or (
+                item.decision.resource_fingerprint if item.decision is not None else ""
+            )
+            pools[fp].append(item)
+
+        reordered: list[BatchItemResult] = []
+        for new_index, resource in enumerate(resources):
+            fp = fingerprint(resource)
+            pool = pools.get(fp)
+            if not pool:
+                # 批次指纹一致 => 条目指纹多重集必然一致；走到这里说明
+                # 存储记录损坏，必须明确报错，绝不能静默错位
+                raise StorageError(
+                    "批次记录与本次请求的条目无法对齐（记录可能损坏）",
+                    {
+                        "batch_id": stored.batch_id,
+                        "request_index": new_index,
+                        "item_fingerprint": fp,
+                    },
+                )
+            item = pool.popleft()
+            reordered.append(
+                replace(
+                    item,
+                    index=new_index,
+                    reused=item.reused or item.status == BATCH_ITEM_DECIDED,
+                )
+            )
+
+        logger.info(
+            "batch replay reordered batch_id=%s items=%d 按本次提交顺序对齐",
+            stored.batch_id,
+            len(reordered),
+        )
+        return replace(stored, items=tuple(reordered), reused=True)
+
     def _admit_item(self, index: int, resource: Any, policy: Policy) -> BatchItemResult:
         """判定单条资源；不合法时返回 invalid 条目而不是中断整批。"""
+        item_fp = fingerprint(resource)
         try:
             validate_resource(resource)
         except ResourceValidationError as exc:
@@ -158,6 +216,7 @@ class BatchService:
                 decision=None,
                 reused=False,
                 error=exc.to_dict(),
+                item_fingerprint=item_fp,
             )
 
         decision, reused = self._evaluator.admit_against_policy(resource, policy)
@@ -177,6 +236,7 @@ class BatchService:
             decision=decision,
             reused=reused,
             error=None,
+            item_fingerprint=item_fp,
         )
 
     @staticmethod

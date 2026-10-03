@@ -30,7 +30,7 @@ app/
 ├── app.py             # FastAPI 工厂与错误映射
 data/sample-policy.json# 示例策略
 docs/                  # 策略模型 / 豁免规则 / 版本复现 / 批量准入与重复上报
-tests/                 # 90 个测试（畸形策略、越界/过期豁免、并发重复提交、批量准入…）
+tests/                 # 97 个测试（畸形策略、越界/过期豁免、并发重复提交、批量准入…）
 ```
 
 详细设计见：
@@ -110,7 +110,8 @@ curl -s -X POST localhost:8000/api/admit/batch -H 'content-type: application/jso
 - `items[]` 逐条给出结论、命中规则与判定依据；不合法的条目单独标记
   `status=invalid` 及原因，不拖垮整批、也不静默放行；
 - `summary` 汇总整批结论，与提交顺序无关；同一批重复提交返回同一
-  `batch_id` 并标记 `reused: true`。
+  `batch_id` 并标记 `reused: true`；换序重交时 `items[]` 仍按**本次**
+  提交顺序逐条对齐（不合法条目也落回它本次的位置）。
 
 语义细节见 [`docs/batch-admission.md`](docs/batch-admission.md)。
 
@@ -169,6 +170,8 @@ uv run pytest -s
   - 非法状态流转（requested→revoked、重复 approve、终态再流转）；
   - 16 线程并发同键准入、12 线程并发同键豁免申请、并发 approve/reject 只有一个成功；
   - 批量准入：逐条结论与整批汇总、换序一致、混入不合法资源单独标记；
+  - 换序/重复提交时逐条结果按本次提交顺序对齐（含不合法条目落回原位、
+    批内重复条目、多定时任务并发换序同批）；
   - 无幂等标识重复上报收口：串行/并发同内容只留一条，整批重复提交复用首次汇总；
   - 批次执行中发布新策略版本，整批仍按进入时的快照判定；
   - 内容或策略版本变化算新提交，不错误复用；120 条大批量不重不漏；

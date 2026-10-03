@@ -32,6 +32,29 @@
 - **规模**：上百条的批次可稳定跑完；每个资源内容恰好对应一条判定
   记录，不重不漏（见 `test_large_batch_stable_no_duplicate_no_missing`）。
 
+## 换序与重复提交时逐条结果的排列约定
+
+同一批资源内容不变、只是提交先后顺序变了再交一次时，仍算**同一批**
+（`batch_id` 与 `summary` 与首次一致，响应标记 `reused: true`，不产生
+新的批次/判定记录），但**逐条结果按本次请求的提交顺序重新排列**：
+
+- `items[i]` 一定对应本次请求 `resources[i]` 的结论，`index` 字段即
+  本次请求中的位置——上游按提交顺序回填结论时不会错位；
+- 字段缺失或内容不合法的条目（`status=invalid`）同样落回它在本次
+  请求中的位置，错误原因随条目返回；
+- 批内含**完全相同**的条目时，这些位置共享同一条判定记录
+  （内容相同结论必然相同），换序后每个位置仍拿到本位置的结论；
+- 对齐键是条目内容指纹（多重集匹配）；多个定时任务并发提交同一批、
+  且各自顺序不同时，每个响应都按**各自请求**的顺序对齐，批次记录
+  仍然唯一、判定记录不重复；
+- 只有资源内容确实改了、或策略版本换了，才算新的一批（新的
+  `batch_id`，`reused: false`）。
+
+> 注意：`GET /api/batches/{batch_id}` 读回的是落盘的批次记录，其
+> `items[]` 保持首次提交时的顺序（记录不可变）；按本次顺序排列的
+> 语义只作用于 `POST /api/admit/batch` 的响应。
+
+
 ## 重复上报的复用边界
 
 判定记录按两级键去重，全部在存储层锁内做最终裁决，串行重试与
@@ -47,8 +70,10 @@
   返回中的 `decision_id` 即被复用的结论。
 - 整批重复提交：批次内容指纹（排序后的条目指纹 + 策略版本指纹）
   相同即同一个批次，返回首次批次的 `batch_id` 与汇总，
-  响应标记 `reused: true`。批次里只有一部分条目此前判过时，
-  已判条目逐条复用、新条目正常判定，不产生重复记录也不漏条目。
+  响应标记 `reused: true`；逐条结果按本次请求的提交顺序排列
+  （见上节"换序与重复提交时逐条结果的排列约定"）。批次里只有一部分
+  条目此前判过时，已判条目逐条复用、新条目正常判定，不产生重复记录
+  也不漏条目。
 
 ### 什么算"新提交"（必须重新判定，不得复用）
 
@@ -91,14 +116,35 @@ curl -s -X POST localhost:8000/api/admit/batch -H 'content-type: application/jso
 # 再执行一次同一请求 -> reused: true，batch_id 与汇总不变
 ```
 
+换序重交（把 resources 数组倒序再交一次）：
+
+```bash
+# 假设上一请求的资源为 [A, B]，现在按 [B, A] 再交一次
+curl -s -X POST localhost:8000/api/admit/batch -H 'content-type: application/json' -d '{
+  "policy_name": "default",
+  "resources": [
+    {"kind":"Pod"},
+    {"apiVersion":"apps/v1","kind":"Deployment",
+     "metadata":{"name":"web","namespace":"prod"},
+     "spec":{"image":"nginx:latest"}}
+  ]
+}'
+# reused: true，batch_id 与汇总和首次一致；
+# items[0] 是 {"kind":"Pod"} 的 invalid 结论、items[1] 是 web 的 deny 结论，
+# 即逐条结果按【本次】提交顺序排列，index 与 resources 位置一一对应
+```
+
 运行测试（`-s` 打印每条用例的业务场景、策略版本与判定依据）：
 
 ```bash
 uv run pytest -s
 # 只看批量与重复上报相关用例
 uv run pytest tests/test_batch.py -s
+# 只看换序重交与位置对齐相关用例
+uv run pytest tests/test_batch_reorder.py -s
 ```
 
-覆盖：批量提交与汇总、换序一致性、串行/并发无键重复上报、
-批次混入不合法资源、批次执行中策略版本变化、内容/版本变更算新提交、
-120 条大批量、HTTP 端到端。
+覆盖：批量提交与汇总、换序一致性、换序重交逐条位置对齐（含不合法条目
+落回原位、批内重复条目、并发换序同批、HTTP 端到端）、串行/并发无键重复
+上报、批次混入不合法资源、批次执行中策略版本变化、内容/版本变更算新提交、
+120 条大批量。

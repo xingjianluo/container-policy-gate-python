@@ -93,6 +93,7 @@ class BatchStore:
                     "status": item.status,
                     "resource_ref": item.resource_ref,
                     "reused": item.reused,
+                    "item_fingerprint": item.item_fingerprint,
                     "decision": (
                         decision_to_record(item.decision)
                         if item.decision is not None
@@ -129,6 +130,8 @@ class BatchStore:
                 ),
                 reused=i.get("reused", False),
                 error=i.get("error"),
+                # 旧记录缺该字段时，decided 条目可回退用判定里的资源指纹
+                item_fingerprint=i.get("item_fingerprint") or "",
             )
             for i in record["items"]
         )
